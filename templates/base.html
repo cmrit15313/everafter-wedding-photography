@@ -2,7 +2,7 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}EverAfter Studio{% endblock %}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"> <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head>
 <body><nav class="nav"><a class="brand" href="/">EVERAFTER<span>STUDIO</span></a><div><a href="/">Home</a><a href="/admin">Photographer login</a></div></nav>
 <main>{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="alerts">{% for category,message in messages %}<div class="alert {{category}}">{{message}}</div>{% endfor %}</div>{% endif %}{% endwith %}{% block content %}{% endblock %}</main>
 <footer>EVERAFTER STUDIO <span>·</span> Stories, beautifully remembered</footer></body></html>
