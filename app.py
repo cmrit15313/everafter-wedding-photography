@@ -80,6 +80,27 @@ def create_event():
     flash("Wedding event created. Upload photos to begin indexing.", "success")
     return redirect(url_for("event_admin", slug=slug))
 
+@app.route("/admin/event/<slug>/edit", methods=["POST"])
+def edit_event(slug):
+    from flask import session
+    if not session.get("admin_ok"):
+        abort(403)
+    title = request.form.get("title", "").strip()
+    couple = request.form.get("couple", "").strip()
+    date = request.form.get("date", "").strip()
+    if not title:
+        flash("Wedding title cannot be empty.", "error")
+        return redirect(url_for("event_admin", slug=slug))
+    with db() as con:
+        cur = con.execute(
+            "UPDATE events SET title=?, couple=?, date=? WHERE slug=?",
+            (title, couple, date, slug)
+        )
+        if cur.rowcount == 0:
+            abort(404)
+    flash("Wedding details updated successfully.", "success")
+    return redirect(url_for("event_admin", slug=slug))
+
 @app.route("/admin/event/<slug>", methods=["GET", "POST"])
 def event_admin(slug):
     from flask import session
