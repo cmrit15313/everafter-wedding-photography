@@ -1,6 +1,8 @@
 import os, sqlite3, secrets, json
 from pathlib import Path
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, send_from_directory, abort
+from io import BytesIO
+import qrcode
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, send_from_directory, send_file, abort
 from werkzeug.utils import secure_filename
 
 BASE = Path(__file__).resolve().parent
