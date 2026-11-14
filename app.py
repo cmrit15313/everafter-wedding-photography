@@ -154,7 +154,42 @@ def save_descriptors(photo_id):
         if cur.rowcount == 0:
             return jsonify({"error":"Photo not found"}), 404
     return jsonify({"saved":len(clean)})
+@app.route("/admin/event/<slug>/qr.png")
+def event_qr(slug):
+    from flask import session
 
+    if not session.get("admin_ok"):
+        abort(403)
+
+    with db() as con:
+        event = con.execute(
+            "SELECT slug FROM events WHERE slug=?", (slug,)
+        ).fetchone()
+
+    if not event:
+        abort(404)
+
+    public_url = (
+        SITE_URL or request.url_root.rstrip("/")
+    ) + url_for("guest_event", slug=slug)
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=10,
+        border=4
+    )
+
+    qr.add_data(public_url)
+    qr.make(fit=True)
+
+    image = qr.make_image(fill_color="black", back_color="white")
+
+    output = BytesIO()
+    image.save(output, format="PNG")
+    output.seek(0)
+
+    return send_file(output, mimetype="image/png")
 @app.route("/event/<slug>")
 def guest_event(slug):
     with db() as con:
