@@ -57,3 +57,13 @@ This is a working MVP/prototype, not a production-secure biometric service.
 - No customer checkout, favorites, bulk ZIP download, multi-photographer accounts, or automatic cloud deployment.
 - Event galleries are accessible to anyone with the event URL/QR. Add a PIN or signed guest link if you need restricted access.
 - Local SQLite and `uploads/` are suitable for a demo or small test, not multi-server production hosting.
+
+
+## Update included in this revision
+- Added an **Edit wedding details** form to each event management page.
+- Admins can change the event title, couple names, and date without creating a new event.
+- Added lazy loading and asynchronous decoding to event photo thumbnails.
+- Face indexing skips photos that already have descriptors, reducing repeat indexing time.
+
+## Important: permanent private storage is not yet configured
+This revision does **not** migrate existing SQLite records or uploaded files to Supabase. Do not treat the current `uploads/` folder or `wedding.db` as durable on Render. Before using real wedding photos, configure a Supabase project with a private Storage bucket and a persistent PostgreSQL database, then migrate the existing records and files. Never expose the Supabase service-role key in browser JavaScript or commit it to GitHub.
