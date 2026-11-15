@@ -26,7 +26,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in the Render environment.")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def storage_signed_url(path, expires_in=3600):
+def storage_signed_url(path, expires_in=86400):
     """Return a time-limited URL for an object in the private Supabase bucket."""
     result = supabase.storage.from_(SUPABASE_BUCKET).create_signed_url(path, expires_in)
     if isinstance(result, dict):
