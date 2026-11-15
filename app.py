@@ -190,6 +190,38 @@ def create_photo_upload_token(slug):
         return jsonify({"error": "Supabase did not return an upload token."}), 502
     return jsonify({"path": object_path, "token": token, "bucket": SUPABASE_BUCKET})
 
+@app.route("/api/admin/event/<slug>/photos/import-root", methods=["POST"])
+def import_existing_root_photos(slug):
+    from flask import session
+    if not session.get("admin_ok"):
+        abort(403)
+    with db() as con:
+        event = con.execute("SELECT id FROM events WHERE slug=?", (slug,)).fetchone()
+        if not event:
+            abort(404)
+    try:
+        objects = supabase.storage.from_(SUPABASE_BUCKET).list()
+        imported = 0
+        with db() as con:
+            for item in objects:
+                name = item.get("name", "") if isinstance(item, dict) else ""
+                if not name or "/" in name or not allowed(name):
+                    continue
+                # Only import actual image objects, not folder placeholders.
+                if isinstance(item, dict) and item.get("id") is None and item.get("metadata") is None:
+                    continue
+                exists = con.execute(
+                    "SELECT id FROM photos WHERE event_id=? AND filename=?",
+                    (event["id"], name)
+                ).fetchone()
+                if not exists:
+                    con.execute("INSERT INTO photos(event_id,filename) VALUES(?,?)", (event["id"], name))
+                    imported += 1
+        return jsonify({"success": True, "imported": imported})
+    except Exception as exc:
+        app.logger.exception("Could not import existing root photos from Supabase")
+        return jsonify({"error": "Could not read the existing bucket files: " + str(exc)}), 502
+
 @app.route("/api/admin/event/<slug>/photos/complete", methods=["POST"])
 def complete_photo_upload(slug):
     from flask import session
