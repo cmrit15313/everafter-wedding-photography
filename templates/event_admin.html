@@ -23,6 +23,8 @@
 <input id="photoFiles" type="file" accept="image/jpeg,image/png,image/webp" multiple>
 <button class="btn" id="uploadBtn" type="button">Compress and upload photos</button>
 <div id="uploadStatus" class="status" aria-live="polite">No files selected.</div>
+<button class="btn btn-outline" id="importRootBtn" type="button">Add existing photos from Supabase bucket root</button>
+<div id="importRootStatus" class="status" aria-live="polite">Your previously uploaded root-level photos will remain unchanged.</div>
 <progress id="uploadProgress" max="100" value="0" style="width:100%;display:none"></progress>
 </div>
 
