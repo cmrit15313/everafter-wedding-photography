@@ -104,4 +104,24 @@
       picker.disabled = false;
     }
   });
+
+  const importButton = document.getElementById("importRootBtn");
+  const importStatus = document.getElementById("importRootStatus");
+  importButton?.addEventListener("click", async () => {
+    if (!window.confirm("Attach existing image files from the root of your wedding-photos bucket to this event? Existing storage files will not be changed or deleted.")) return;
+    importButton.disabled = true;
+    importStatus.textContent = "Checking existing Supabase photos…";
+    try {
+      const response = await fetch("/api/admin/event/" + encodeURIComponent(window.EVENT_SLUG) + "/photos/import-root", {
+        method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: "{}"
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not import existing photos.");
+      importStatus.textContent = "Added " + data.imported + " existing photo(s) to this event. Refreshing gallery…";
+      window.location.reload();
+    } catch (error) {
+      importStatus.textContent = "Import failed: " + (error.message || "Unknown error");
+      importButton.disabled = false;
+    }
+  });
 })();
