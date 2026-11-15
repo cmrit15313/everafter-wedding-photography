@@ -1,6 +1,8 @@
 from supabase import create_client
 import mimetypes
 import os, sqlite3, secrets, json
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from pathlib import Path
 from io import BytesIO
 import qrcode
@@ -46,23 +48,93 @@ def photo_url(filename):
         return url_for("uploaded_file", filename=filename)
     return storage_signed_url(filename)
 
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("Set DATABASE_URL to your Supabase PostgreSQL connection string in Render.")
+
+class PostgresDB:
+    """Small compatibility wrapper for the existing parameterized SQL calls."""
+    def __init__(self):
+        self.connection = psycopg2.connect(DATABASE_URL, sslmode="require")
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self.connection.commit()
+            else:
+                self.connection.rollback()
+        finally:
+            self.connection.close()
+    def execute(self, sql, params=()):
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        cursor.execute(sql.replace("?", "%s"), params)
+        return cursor
+
 def db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return PostgresDB()
 
 def init_db():
     with db() as con:
         con.execute("""CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT UNIQUE NOT NULL,
+            id BIGSERIAL PRIMARY KEY, slug TEXT UNIQUE NOT NULL,
             title TEXT NOT NULL, couple TEXT DEFAULT '', date TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
         con.execute("""CREATE TABLE IF NOT EXISTS photos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL,
-            filename TEXT NOT NULL, descriptors TEXT DEFAULT '[]',
-            FOREIGN KEY(event_id) REFERENCES events(id))""")
+            id BIGSERIAL PRIMARY KEY, event_id BIGINT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            filename TEXT NOT NULL, descriptors TEXT DEFAULT '[]')""")
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS photos_event_filename_unique ON photos(event_id, filename)")
+
+def migrate_legacy_sqlite():
+    """Copy any still-present Render SQLite records into Supabase once, without deleting the source."""
+    if not DB.exists():
+        app.logger.info("No legacy SQLite database found; starting with Supabase PostgreSQL.")
+        return
+    try:
+        legacy = sqlite3.connect(DB)
+        legacy.row_factory = sqlite3.Row
+        old_events = legacy.execute("SELECT * FROM events").fetchall()
+        old_photos = legacy.execute("SELECT * FROM photos").fetchall()
+        with db() as con:
+            event_ids = {}
+            for event in old_events:
+                saved = con.execute(
+                    """INSERT INTO events(id,slug,title,couple,date,created_at)
+                       VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(slug) DO UPDATE SET
+                         title=EXCLUDED.title, couple=EXCLUDED.couple, date=EXCLUDED.date
+                       RETURNING id""",
+                    (event["id"], event["slug"], event["title"], event["couple"], event["date"], event["created_at"])
+                ).fetchone()
+                event_ids[event["id"]] = saved["id"]
+            for photo in old_photos:
+                new_event_id = event_ids.get(photo["event_id"])
+                if new_event_id is None:
+                    continue
+                found = con.execute(
+                    "SELECT id FROM photos WHERE event_id=? AND filename=?",
+                    (new_event_id, photo["filename"])
+                ).fetchone()
+                if not found:
+                    con.execute(
+                        "INSERT INTO photos(event_id,filename,descriptors) VALUES(?,?,?)",
+                        (new_event_id, photo["filename"], photo["descriptors"] or "[]")
+                    )
+        with db() as con:
+            con.execute("""SELECT setval(pg_get_serial_sequence('events','id'),
+                         COALESCE((SELECT MAX(id) FROM events), 1),
+                         EXISTS(SELECT 1 FROM events))""")
+            con.execute("""SELECT setval(pg_get_serial_sequence('photos','id'),
+                         COALESCE((SELECT MAX(id) FROM photos), 1),
+                         EXISTS(SELECT 1 FROM photos))""")
+        legacy.close()
+        app.logger.info("Legacy SQLite records copied to Supabase PostgreSQL; source file was retained.")
+    except Exception:
+        app.logger.exception("Legacy SQLite migration failed; check DATABASE_URL and database permissions.")
+        raise
 
 init_db()
+migrate_legacy_sqlite()
 
 def allowed(name):
     return "." in name and name.rsplit(".", 1)[1].lower() in ALLOWED
