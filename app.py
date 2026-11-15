@@ -1,6 +1,8 @@
 from supabase import create_client
 import mimetypes
 import os, sqlite3, secrets, json
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from pathlib import Path
 from io import BytesIO
 import qrcode
@@ -19,27 +21,120 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-me")
 SITE_URL = os.environ.get("SITE_URL", "").rstrip("/")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 SUPABASE_BUCKET = "wedding-photos"
 
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in the Render environment.")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+def storage_signed_url(path, expires_in=86400):
+    """Return a time-limited URL for an object in the private Supabase bucket."""
+    result = supabase.storage.from_(SUPABASE_BUCKET).create_signed_url(path, expires_in)
+    if isinstance(result, dict):
+        signed = result.get("signedURL") or result.get("signedUrl") or result.get("signed_url")
+    else:
+        signed = getattr(result, "signed_url", None) or getattr(result, "signedURL", None)
+    if not signed:
+        raise RuntimeError("Supabase did not return a signed download URL.")
+    if signed.startswith("/"):
+        signed = SUPABASE_URL.rstrip("/") + "/storage/v1" + signed
+    return signed
+
+def photo_url(filename):
+    # Keep compatibility with older files that still exist on the local disk.
+    local_file = UPLOAD_DIR / filename
+    if "/" not in filename and local_file.is_file():
+        return url_for("uploaded_file", filename=filename)
+    return storage_signed_url(filename)
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("Set DATABASE_URL to your Supabase PostgreSQL connection string in Render.")
+
+class PostgresDB:
+    """Small compatibility wrapper for the existing parameterized SQL calls."""
+    def __init__(self):
+        self.connection = psycopg2.connect(DATABASE_URL, sslmode="require")
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self.connection.commit()
+            else:
+                self.connection.rollback()
+        finally:
+            self.connection.close()
+    def execute(self, sql, params=()):
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        cursor.execute(sql.replace("?", "%s"), params)
+        return cursor
+
 def db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return PostgresDB()
 
 def init_db():
     with db() as con:
         con.execute("""CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT UNIQUE NOT NULL,
+            id BIGSERIAL PRIMARY KEY, slug TEXT UNIQUE NOT NULL,
             title TEXT NOT NULL, couple TEXT DEFAULT '', date TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
         con.execute("""CREATE TABLE IF NOT EXISTS photos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL,
-            filename TEXT NOT NULL, descriptors TEXT DEFAULT '[]',
-            FOREIGN KEY(event_id) REFERENCES events(id))""")
+            id BIGSERIAL PRIMARY KEY, event_id BIGINT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            filename TEXT NOT NULL, descriptors TEXT DEFAULT '[]')""")
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS photos_event_filename_unique ON photos(event_id, filename)")
+
+def migrate_legacy_sqlite():
+    """Copy any still-present Render SQLite records into Supabase once, without deleting the source."""
+    if not DB.exists():
+        app.logger.info("No legacy SQLite database found; starting with Supabase PostgreSQL.")
+        return
+    try:
+        legacy = sqlite3.connect(DB)
+        legacy.row_factory = sqlite3.Row
+        old_events = legacy.execute("SELECT * FROM events").fetchall()
+        old_photos = legacy.execute("SELECT * FROM photos").fetchall()
+        with db() as con:
+            event_ids = {}
+            for event in old_events:
+                saved = con.execute(
+                    """INSERT INTO events(id,slug,title,couple,date,created_at)
+                       VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(slug) DO UPDATE SET
+                         title=EXCLUDED.title, couple=EXCLUDED.couple, date=EXCLUDED.date
+                       RETURNING id""",
+                    (event["id"], event["slug"], event["title"], event["couple"], event["date"], event["created_at"])
+                ).fetchone()
+                event_ids[event["id"]] = saved["id"]
+            for photo in old_photos:
+                new_event_id = event_ids.get(photo["event_id"])
+                if new_event_id is None:
+                    continue
+                found = con.execute(
+                    "SELECT id FROM photos WHERE event_id=? AND filename=?",
+                    (new_event_id, photo["filename"])
+                ).fetchone()
+                if not found:
+                    con.execute(
+                        "INSERT INTO photos(event_id,filename,descriptors) VALUES(?,?,?)",
+                        (new_event_id, photo["filename"], photo["descriptors"] or "[]")
+                    )
+        with db() as con:
+            con.execute("""SELECT setval(pg_get_serial_sequence('events','id'),
+                         COALESCE((SELECT MAX(id) FROM events), 1),
+                         EXISTS(SELECT 1 FROM events))""")
+            con.execute("""SELECT setval(pg_get_serial_sequence('photos','id'),
+                         COALESCE((SELECT MAX(id) FROM photos), 1),
+                         EXISTS(SELECT 1 FROM photos))""")
+        legacy.close()
+        app.logger.info("Legacy SQLite records copied to Supabase PostgreSQL; source file was retained.")
+    except Exception:
+        app.logger.exception("Legacy SQLite migration failed; check DATABASE_URL and database permissions.")
+        raise
 
 init_db()
+migrate_legacy_sqlite()
 
 def allowed(name):
     return "." in name and name.rsplit(".", 1)[1].lower() in ALLOWED
@@ -121,20 +216,15 @@ def event_admin(slug):
     if not event:
         abort(404)
     if request.method == "POST":
-        count = 0
-        for f in request.files.getlist("photos"):
-            if not f or not f.filename or not allowed(f.filename):
-                continue
-            ext = f.filename.rsplit(".", 1)[1].lower()
-            filename = secure_filename(f"{secrets.token_hex(8)}.{ext}")
-            f.save(UPLOAD_DIR / filename)
-            with db() as con:
-                con.execute("INSERT INTO photos(event_id,filename) VALUES(?,?)", (event["id"], filename))
-            count += 1
-        flash(f"Uploaded {count} photo(s). Open the event page and use Index photos on this device to prepare face matches.", "success")
-        return redirect(url_for("event_admin", slug=slug))
+        abort(405)
     public_url = (SITE_URL or request.url_root.rstrip("/")) + url_for("guest_event", slug=slug)
-    return render_template("event_admin.html", event=event, photos=photos, public_url=public_url)
+    gallery_photos = []
+    for p in photos:
+        try:
+            gallery_photos.append({"filename": p["filename"], "url": photo_url(p["filename"])})
+        except Exception:
+            app.logger.exception("Could not create photo URL for %s", p["filename"])
+    return render_template("event_admin.html", event=event, photos=gallery_photos, public_url=public_url, supabase_anon_key=SUPABASE_ANON_KEY, supabase_url=SUPABASE_URL)
 
 @app.route("/api/event/<slug>/photos")
 def photo_data(slug):
@@ -143,7 +233,86 @@ def photo_data(slug):
         if not event:
             return jsonify({"error":"Event not found"}), 404
         photos = con.execute("SELECT id,filename,descriptors FROM photos WHERE event_id=?", (event["id"],)).fetchall()
-    return jsonify({"event": dict(event), "photos":[{"id":p["id"],"url":url_for("uploaded_file", filename=p["filename"]),"descriptors":json.loads(p["descriptors"] or "[]")} for p in photos]})
+    result = []
+    for p in photos:
+        try:
+            result.append({"id": p["id"], "url": photo_url(p["filename"]), "descriptors": json.loads(p["descriptors"] or "[]")})
+        except Exception:
+            app.logger.exception("Could not create photo URL for %s", p["filename"])
+    return jsonify({"event": dict(event), "photos": result})
+
+@app.route("/api/admin/event/<slug>/upload-token", methods=["POST"])
+def create_photo_upload_token(slug):
+    from flask import session
+    if not session.get("admin_ok"):
+        abort(403)
+    if not SUPABASE_ANON_KEY:
+        return jsonify({"error": "SUPABASE_ANON_KEY is missing from the Render environment."}), 503
+    with db() as con:
+        event = con.execute("SELECT id FROM events WHERE slug=?", (slug,)).fetchone()
+    if not event:
+        abort(404)
+    # Unique path per upload: never overwrite an existing wedding photo.
+    object_path = f"{slug}/{secrets.token_hex(16)}.jpg"
+    signed = supabase.storage.from_(SUPABASE_BUCKET).create_signed_upload_url(object_path)
+    token = getattr(signed, "token", None)
+    if isinstance(signed, dict):
+        token = signed.get("token", token)
+    if not token:
+        return jsonify({"error": "Supabase did not return an upload token."}), 502
+    return jsonify({"path": object_path, "token": token, "bucket": SUPABASE_BUCKET})
+
+@app.route("/api/admin/event/<slug>/photos/import-root", methods=["POST"])
+def import_existing_root_photos(slug):
+    from flask import session
+    if not session.get("admin_ok"):
+        abort(403)
+    with db() as con:
+        event = con.execute("SELECT id FROM events WHERE slug=?", (slug,)).fetchone()
+        if not event:
+            abort(404)
+    try:
+        objects = supabase.storage.from_(SUPABASE_BUCKET).list()
+        imported = 0
+        with db() as con:
+            for item in objects:
+                name = item.get("name", "") if isinstance(item, dict) else ""
+                if not name or "/" in name or not allowed(name):
+                    continue
+                # Only import actual image objects, not folder placeholders.
+                if isinstance(item, dict) and item.get("id") is None and item.get("metadata") is None:
+                    continue
+                exists = con.execute(
+                    "SELECT id FROM photos WHERE event_id=? AND filename=?",
+                    (event["id"], name)
+                ).fetchone()
+                if not exists:
+                    con.execute("INSERT INTO photos(event_id,filename) VALUES(?,?)", (event["id"], name))
+                    imported += 1
+        return jsonify({"success": True, "imported": imported})
+    except Exception as exc:
+        app.logger.exception("Could not import existing root photos from Supabase")
+        return jsonify({"error": "Could not read the existing bucket files: " + str(exc)}), 502
+
+@app.route("/api/admin/event/<slug>/photos/complete", methods=["POST"])
+def complete_photo_upload(slug):
+    from flask import session
+    import re
+    if not session.get("admin_ok"):
+        abort(403)
+    data = request.get_json(silent=True) or {}
+    object_path = data.get("path", "")
+    if not isinstance(object_path, str) or not re.fullmatch(re.escape(slug) + r"/[a-f0-9]{32}\.jpg", object_path):
+        return jsonify({"error": "Invalid upload path."}), 400
+    with db() as con:
+        event = con.execute("SELECT id FROM events WHERE slug=?", (slug,)).fetchone()
+        if not event:
+            abort(404)
+        existing = con.execute("SELECT id FROM photos WHERE event_id=? AND filename=?", (event["id"], object_path)).fetchone()
+        if not existing:
+            con.execute("INSERT INTO photos(event_id,filename) VALUES(?,?)", (event["id"], object_path))
+        photo = con.execute("SELECT id FROM photos WHERE event_id=? AND filename=?", (event["id"], object_path)).fetchone()
+    return jsonify({"success": True, "id": photo["id"], "url": storage_signed_url(object_path)})
 
 @app.route("/api/photo/<int:photo_id>/descriptors", methods=["POST"])
 def save_descriptors(photo_id):
@@ -207,7 +376,11 @@ def guest_event(slug):
 
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
-    return send_from_directory(UPLOAD_DIR, filename)
+    # Older local uploads remain readable; Supabase objects use short-lived signed URLs.
+    local_file = UPLOAD_DIR / filename
+    if local_file.is_file():
+        return send_from_directory(UPLOAD_DIR, filename)
+    return redirect(storage_signed_url(filename))
 
 @app.route("/logout")
 def logout():
