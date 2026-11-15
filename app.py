@@ -1,3 +1,5 @@
+from supabase import create_client
+import mimetypes
 import os, sqlite3, secrets, json
 from pathlib import Path
 from io import BytesIO
@@ -15,6 +17,11 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-before-deploying")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-me")
 SITE_URL = os.environ.get("SITE_URL", "").rstrip("/")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_BUCKET = "wedding-photos"
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def db():
     conn = sqlite3.connect(DB)
